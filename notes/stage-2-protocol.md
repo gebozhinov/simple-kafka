@@ -370,3 +370,75 @@ the broker create them automatically on the first produce, with default settings
   than before, and per-key ordering breaks during the switch. Choose the count carefully up front.
 - **Replication factor** can't be changed with a simple setting; it needs a partition reassignment
   (`kafka-reassign-partitions.sh`).
+
+---
+
+## `encodeReplicateRequest` (String topic, int partition, long offset, byte[] message)
+
+### Purpose
+This is **not** sent by a client. It's **broker-to-broker**: the leader of a partition sends it to
+each follower, saying *"store this message in topic X, partition Y, at offset Z"*.
+This is how followers get their copies (see `brokers.md`, leaders and replicas).
+
+### Wire layout
+
+| Field          | Type  | Size (bytes) |
+|----------------|-------|--------------|
+| request type   | byte  | 1            |
+| topic length   | short | 2            |
+| topic          | bytes | N            |
+| partition      | int   | 4            |
+| offset         | long  | 8            |
+| message length | int   | 4            |
+| message        | bytes | M            |
+
+Fixed part: `1 + 2 + 4 + 8 + 4 = 19`.
+
+It's the produce request **plus an offset**.
+
+### Example
+Broker 2 leads `orders-1`, broker 3 is the follower.
+
+1. A producer sends "hi" to broker 2 (produce request, **no offset**).
+2. Broker 2 appends it and assigns **offset 7**.
+3. Broker 2 sends to broker 3: `encodeReplicateRequest("orders", 1, 7, "hi".getBytes())` → 27 bytes (19 + 6 + 2):
+
+```
+21 | 00 06 | 6F 72 64 65 72 73 | 00 00 00 01 | 00 00 00 00 00 00 00 07 | 00 00 00 02 | 68 69
+^    ^       "orders"            partition=1   offset=7                  msg length=2  "hi"
+REPLICATE
+```
+
+4. Broker 3 stores "hi" at offset 7 in its copy of `orders-1`.
+
+### Why the offset is included here, but not in produce
+The **leader decides offsets**. A producer can't choose one, so produce has no offset field.
+A follower must not choose one either: its copy has to be **identical** to the leader's,
+otherwise "offset 7" would mean different messages on different brokers. So the leader tells it the exact offset.
+
+If a consumer reads `orders-1` offset 7 from broker 2 today, and broker 3 becomes the leader tomorrow,
+offset 7 must still be "hi".
+
+### What if this method didn't exist?
+Followers would never get any data. `replicationFactor` would be just a number: if the leader dies,
+the new leader has an empty partition, and the messages are lost.
+
+### Push vs pull: simple-kafka vs real Kafka
+- **simple-kafka = push.** The leader sends each message to the followers (this request).
+- **Real Kafka = pull.** There is no "replicate" request. Followers send normal **Fetch** requests to
+  the leader (with their broker id, so the leader knows it's a replica, not a consumer), exactly like a consumer.
+
+Why Kafka pulls:
+- each follower fetches at its own speed, and a slow follower doesn't slow down the leader
+- followers fetch many messages in one request (batching) instead of one request per message
+- the offset in the follower's fetch tells the leader how far that follower got, which is how the leader
+  knows who is in the **ISR** and when an `acks=all` write is safely copied
+
+### Bug in the GitHub reference
+The reference allocates `17 + topic.length() + message.length`, but writes 19 fixed bytes.
+Every call throws `BufferOverflowException`. It goes unnoticed because the reference broker never calls
+this method: it builds the same bytes inline in `replicateToFollowers()`, with the same wrong size.
+Worse: `BufferOverflowException` is a `RuntimeException`, not an `IOException`, so the `catch (IOException e)`
+there doesn't catch it. It's thrown inside `executor.submit(...)`, and nobody reads the `Future`, so the
+exception disappears **silently**: no log, no error, and the followers never get a copy.
+Lesson: compute buffer sizes from the fields you write, and don't swallow exceptions in background tasks.

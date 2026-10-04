@@ -104,4 +104,28 @@ public class Protocol {
         buffer.flip();
         return buffer;
     }
+
+    /**
+     * Serializes a replicate request: broker-to-broker, sent by a partition's leader to its followers
+     * so they store a copy of the message at the same offset.
+     * <p>
+     * Wire layout:
+     * [type:1][topicLen:2][topic:N][partition:4][offset:8][msgLen:4][message:M]
+     * <p>
+     * Fixed part = 1 + 2 + 4 + 8 + 4 = 19 bytes.
+     * See notes/stage-2-protocol.md for an example.
+     */
+    public static ByteBuffer encodeReplicateRequest(String topic, int partition, long offset, byte[] message) {
+        byte[] topicBytes = topic.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buffer = ByteBuffer.allocate(19 + topicBytes.length + message.length);
+        buffer.put(REPLICATE);
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
+        buffer.putInt(partition);
+        buffer.putLong(offset);
+        buffer.putInt(message.length);
+        buffer.put(message);
+        buffer.flip();
+        return buffer;
+    }
 }
