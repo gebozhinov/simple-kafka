@@ -1,6 +1,8 @@
 package com.simplekafka.broker;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +25,16 @@ public class Protocol {
     public static final byte REPLICATE = 0x21;
     public static final byte REPLICATE_ACK = 0x22;
     public static final byte TOPIC_NOTIFICATION = 0x23;
+
+    public static void sendErrorResponse(SocketChannel channel, String errorMessage) throws IOException {
+        byte[] topicBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buffer = ByteBuffer.allocate(3 + topicBytes.length);
+        buffer.put(ERROR_RESPONSE);
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
+        buffer.flip();
+        channel.write(buffer);
+    }
 
     /**
      * Serializes a produce request into bytes ready to be written to a socket.
