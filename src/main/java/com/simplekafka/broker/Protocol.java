@@ -2,6 +2,8 @@ package com.simplekafka.broker;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 public class Protocol {
     // Client request types
@@ -214,11 +216,84 @@ public class Protocol {
     }
 
     /**
+     * Turns the broker's answer to a metadata request into a {@link MetadataResult}.
+     * <p>
+     * Layout (each list starts with a count):
+     * [METADATA_RESPONSE:1]
+     * [brokerCount:4]  per broker:    [id:4][hostLen:2][host:N][port:4]
+     * [topicCount:4]   per topic:     [topicLen:2][topic:N][partitionCount:4]
+     * per partition: [partitionId:4][leaderId:4][followerCount:4][followerId:4]...
+     * <p>
+     * Or an error: [ERROR_RESPONSE:1][errorLen:2][error:N]
+     * See notes/stage-2-protocol.md for an example.
+     */
+    public static MetadataResult decodeMetadataResponse(ByteBuffer buffer) {
+        byte responseType = buffer.get();
+        if (responseType != METADATA_RESPONSE) {
+            if (responseType == ERROR_RESPONSE) {
+                short errorLength = buffer.getShort();
+                byte[] errorBytes = new byte[errorLength];
+                buffer.get(errorBytes);
+                String error = new String(errorBytes, StandardCharsets.UTF_8);
+                return new MetadataResult(new ArrayList<>(), new ArrayList<>(), error);
+            }
+            return new MetadataResult(new ArrayList<>(), new ArrayList<>(), "Invalid response type");
+        }
+
+        // Parse broker info
+        int brokerCount = buffer.getInt();
+        List<BrokerInfo> brokers = new ArrayList<>();
+
+        for (int i = 0; i < brokerCount; i++) {
+            int brokerId = buffer.getInt();
+            short hostLength = buffer.getShort();
+            byte[] hostBytes = new byte[hostLength];
+            buffer.get(hostBytes);
+            String host = new String(hostBytes, StandardCharsets.UTF_8);
+            int port = buffer.getInt();
+
+            brokers.add(new BrokerInfo(brokerId, host, port));
+        }
+
+        // Parse topic metadata
+        int topicCount = buffer.getInt();
+        List<TopicMetadata> topics = new ArrayList<>();
+
+        for (int i = 0; i < topicCount; i++) {
+            short topicLength = buffer.getShort();
+            byte[] topicBytes = new byte[topicLength];
+            buffer.get(topicBytes);
+            String topicName = new String(topicBytes, StandardCharsets.UTF_8);
+
+            int partitionCount = buffer.getInt();
+            List<PartitionMetadata> partitions = new ArrayList<>();
+
+            for (int j = 0; j < partitionCount; j++) {
+                int partitionId = buffer.getInt();
+                int leaderId = buffer.getInt();
+
+                int replicas = buffer.getInt();
+                List<Integer> replicaIds = new ArrayList<>();
+
+                for (int k = 0; k < replicas; k++) {
+                    replicaIds.add(buffer.getInt());
+                }
+
+                partitions.add(new PartitionMetadata(partitionId, leaderId, replicaIds));
+            }
+
+            topics.add(new TopicMetadata(topicName, partitions));
+        }
+
+        return new MetadataResult(brokers, topics, null);
+    }
+
+    /**
      * Result record for produce operations
      */
     public record ProduceResult(long offset, String error) {
 
-    public boolean isSuccess() {
+        public boolean isSuccess() {
             return error == null;
         }
     }
@@ -228,12 +303,34 @@ public class Protocol {
      */
     public record FetchResult(byte[][] messages, String error) {
 
-    public int messageCount() {
+        public int messageCount() {
             return messages.length;
         }
 
-    public boolean isSuccess() {
-        return error == null;
+        public boolean isSuccess() {
+            return error == null;
+        }
     }
+
+    /**
+     * Result record for metadata operations
+     */
+    public record MetadataResult(List<BrokerInfo> brokers, List<TopicMetadata> topics, String error) {
+
+        public boolean isSuccess() {
+            return error == null;
+        }
+    }
+
+    /**
+     * Topic metadata record
+     */
+    public record TopicMetadata(String name, List<PartitionMetadata> partitions) {
+    }
+
+    /**
+     * Partition metadata record
+     */
+    public record PartitionMetadata(int id, int leader, List<Integer> replicas) {
     }
 }
