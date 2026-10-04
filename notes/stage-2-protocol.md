@@ -612,3 +612,135 @@ or a disk-full broker would look exactly like success.
   });
   ```
 - With `acks=0` there is **no response at all**, so the offset is unknown (`-1`) and errors are never reported.
+
+---
+
+## `decodeFetchResponse` (ByteBuffer buffer)
+
+### Purpose
+The consumer sent `encodeFetchRequest("orders", 0, offset=5, maxBytes=1024)`. The broker answers with
+the messages it found. This method turns those bytes into a `FetchResult`: **the list of messages**,
+or an **error**.
+
+```
+consumer ──encodeFetchRequest──▶ broker (reads messages from the partition log)
+consumer ◀─── response bytes ─── broker
+         decodeFetchResponse → FetchResult(messages=[...], error=null)
+```
+
+### The broker can answer in two shapes (first byte decides)
+
+**1. A fetch response:**
+
+```
+[FETCH_RESPONSE:1][messageCount:4]
+    then messageCount times:  [offset:8][messageSize:4][message:M]
+```
+
+| Field         | Type  | Size | Meaning                                 |
+|---------------|-------|------|-----------------------------------------|
+| response type | byte  | 1    | `FETCH_RESPONSE` (0x12)                 |
+| message count | int   | 4    | how many messages follow (can be 0)     |
+| *per message:*|       |      |                                         |
+| offset        | long  | 8    | the message's offset in the partition   |
+| message size  | int   | 4    | how many bytes the message has          |
+| message       | bytes | M    | the message itself                      |
+
+This is new compared to produce: a **repeated group**. The count says how many times to repeat
+the `[offset][size][message]` block, and each block has its own length prefix.
+
+**2. An error response:** `[ERROR_RESPONSE:1][errorLen:2][error:N]`, same as in produce
+(e.g. "Topic does not exist", "Partition does not exist").
+
+### Line by line
+```java
+byte responseType = buffer.get();                 // 1 byte: which shape?
+if (responseType != FETCH_RESPONSE) {
+    if (responseType == ERROR_RESPONSE) {         // broker error with a text message
+        short errorLength = buffer.getShort();
+        byte[] errorBytes = new byte[errorLength];
+        buffer.get(errorBytes);
+        String error = new String(errorBytes, StandardCharsets.UTF_8);
+        return new FetchResult(new byte[0][], error);    // no messages + the error
+    }
+    return new FetchResult(new byte[0][], "Invalid response type");
+}
+
+int messageCount = buffer.getInt();               // 4 bytes: how many messages follow
+byte[][] messages = new byte[messageCount][];     // an array of messages; each message is a byte[]
+                                                  // (sizes unknown yet, so the inner arrays are null for now)
+for (int i = 0; i < messageCount; i++) {
+    long offset = buffer.getLong();               // 8 bytes: the offset (read, then thrown away)
+    int messageSize = buffer.getInt();            // 4 bytes: size of this message
+    messages[i] = new byte[messageSize];          // room for exactly this message
+    buffer.get(messages[i]);                      // copy its bytes out
+}
+return new FetchResult(messages, null);
+```
+
+**`byte[][]`** = "array of byte arrays". One message is a `byte[]`, so many messages are a `byte[][]`.
+`new byte[3][]` creates 3 empty slots; each slot gets its own `new byte[messageSize]` in the loop,
+because every message can have a different size.
+
+**`new byte[0][]`** = an empty list of messages, so the caller can loop over `messages` without
+checking for `null`.
+
+**Why the offset is read even though it's not used:** the bytes are there in the stream. If you skip
+`getLong()`, the cursor stays 8 bytes behind and `getInt()` reads part of the offset as the message size.
+Everything after that is garbage. You must read (or skip with `buffer.position(buffer.position() + 8)`)
+every field the broker wrote.
+
+### Examples
+
+**Two messages** from `encodeFetchRequest("orders", 0, 5, 1024)`:
+```
+12 | 00 00 00 02 |
+     count=2
+     00 00 00 00 00 00 00 05 | 00 00 00 02 | 68 69        offset=5, size=2, "hi"
+     00 00 00 00 00 00 00 06 | 00 00 00 03 | 79 6F 75     offset=6, size=3, "you"
+→ FetchResult(messages=["hi", "you"], error=null)
+```
+The consumer's next fetch uses offset 5 + 2 = **7**.
+
+**No new messages** (offset is at the end of the log):
+```
+12 | 00 00 00 00
+     count=0
+→ FetchResult(messages=[], error=null)
+```
+This is **not an error**. It means "you're caught up, ask again later". (It's also what the consumer gets
+when the next message is bigger than `maxBytes`, see the poison message section above.)
+
+**Error:**
+```
+1F | 00 14 | "Topic does not exist"   (20 bytes = 0x14)
+→ FetchResult(messages=[], error="Topic does not exist")
+```
+
+### Throwing away the offset: a design weakness
+Because the offsets are discarded, the consumer must **assume** they are consecutive: "I asked for 5 and
+got 2 messages, so they were 5 and 6, next is 7". That's how the reference consumer works
+(`currentOffset += messages.size()`).
+
+In real Kafka that assumption is **wrong**: offsets can have gaps (log compaction removes old records,
+transactions add invisible marker records). That's why every Kafka `ConsumerRecord` carries its own
+`offset()`, and the next position is `lastRecord.offset() + 1`, not `start + count`.
+Keeping the offset in the result is the safer design.
+
+### Pitfalls
+- **Trusting the numbers:** `messageCount` and `messageSize` come from the network. Corrupted bytes could say
+  "2 billion messages" → `new byte[2_000_000_000][]` → `OutOfMemoryError`, or a negative size →
+  `NegativeArraySizeException`. Real Kafka validates sizes and checks a CRC (checksum) on each batch.
+- **Incomplete data:** a big response can arrive in several TCP pieces. If the buffer holds only part of it,
+  `get()` runs past the end → `BufferUnderflowException`. The code that reads from the socket must collect
+  the whole response before decoding.
+
+### What if this method didn't exist?
+The consumer could ask for messages but couldn't read the answer. Consuming would be impossible.
+
+### Real Kafka equivalent
+- Fetch response (api_key 1): per partition an error code, the **high watermark** (the last offset
+  that's safely copied to all ISR replicas, consumers can't read past it), and **record batches**.
+- What you see in code: `consumer.poll()` returns `ConsumerRecords`, each `ConsumerRecord` has
+  `offset()`, `partition()`, `key()`, `value()`, `timestamp()`, `headers()`. Ours has only the value.
+- An empty `poll()` result is normal, like our `count=0`.

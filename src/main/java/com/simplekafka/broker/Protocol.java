@@ -177,13 +177,63 @@ public class Protocol {
         return new ProduceResult(offset, status == 0 ? null : "Produce failed");
     }
 
-        /**
-         * Result record for produce operations
-         */
-        public record ProduceResult(long offset, String error) {
-
-        public boolean isSuccess() {
-                return error == null;
+    /**
+     * Turns the broker's answer to a fetch request into a {@link FetchResult}.
+     * <p>
+     * Two possible layouts, chosen by the first byte:
+     * [FETCH_RESPONSE:1][count:4] then count x [offset:8][size:4][message:M]
+     * [ERROR_RESPONSE:1][errorLen:2][error:N]
+     * <p>
+     * count = 0 is not an error: there are no new messages yet.
+     * See notes/stage-2-protocol.md for examples.
+     */
+    public static FetchResult decodeFetchResponse(ByteBuffer buffer) {
+        byte responseType = buffer.get();
+        if (responseType != FETCH_RESPONSE) {
+            if (responseType == ERROR_RESPONSE) {
+                short errorLength = buffer.getShort();
+                byte[] errorBytes = new byte[errorLength];
+                buffer.get(errorBytes);
+                String error = new String(errorBytes, StandardCharsets.UTF_8);
+                return new FetchResult(new byte[0][], error);
             }
+            return new FetchResult(new byte[0][], "Invalid response type");
         }
+
+        int messageCount = buffer.getInt();
+        byte[][] messages = new byte[messageCount][];
+
+        for (int i = 0; i < messageCount; i++) {
+            long offset = buffer.getLong(); // Skip offset
+            int messageSize = buffer.getInt();
+            messages[i] = new byte[messageSize];
+            buffer.get(messages[i]);
+        }
+
+        return new FetchResult(messages, null);
+    }
+
+    /**
+     * Result record for produce operations
+     */
+    public record ProduceResult(long offset, String error) {
+
+    public boolean isSuccess() {
+            return error == null;
+        }
+    }
+
+    /**
+     * Result record for fetch operations
+     */
+    public record FetchResult(byte[][] messages, String error) {
+
+    public int messageCount() {
+            return messages.length;
+        }
+
+    public boolean isSuccess() {
+        return error == null;
+    }
+    }
 }
