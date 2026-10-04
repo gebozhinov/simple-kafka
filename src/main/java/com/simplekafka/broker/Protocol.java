@@ -128,4 +128,24 @@ public class Protocol {
         buffer.flip();
         return buffer;
     }
+
+    /**
+     * Serializes a topic notification: broker-to-broker, sent by the controller after creating a topic,
+     * telling other brokers "topic X now exists, load its details". Only the name is sent;
+     * the partition assignments are read from the shared metadata store (ZooKeeper).
+     * <p>
+     * Wire layout: [type:1][topicLen:2][topic:N]
+     * <p>
+     * Fixed part = 1 + 2 = 3 bytes.
+     * See notes/stage-2-protocol.md for an example.
+     */
+    public static ByteBuffer encodeTopicNotification(String topic) {
+        byte[] topicBytes = topic.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buffer = ByteBuffer.allocate(3 + topicBytes.length);
+        buffer.put(TOPIC_NOTIFICATION);
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
+        buffer.flip();
+        return buffer;
+    }
 }

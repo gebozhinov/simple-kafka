@@ -442,3 +442,61 @@ Worse: `BufferOverflowException` is a `RuntimeException`, not an `IOException`, 
 there doesn't catch it. It's thrown inside `executor.submit(...)`, and nobody reads the `Future`, so the
 exception disappears **silently**: no log, no error, and the followers never get a copy.
 Lesson: compute buffer sizes from the fields you write, and don't swallow exceptions in background tasks.
+
+---
+
+## `encodeTopicNotification` (String topic)
+
+### Purpose
+Another **broker-to-broker** message. After a topic is created, the **controller** (the broker in charge
+of the cluster) tells the other brokers: *"topic X now exists, go load its details."*
+
+### Wire layout
+
+| Field        | Type  | Size (bytes) |
+|--------------|-------|--------------|
+| request type | byte  | 1            |
+| topic length | short | 2            |
+| topic        | bytes | N            |
+
+Fixed part: `1 + 2 = 3`.
+
+### Example
+`encodeTopicNotification("orders")` → 9 bytes (3 + 6):
+
+```
+23 | 00 06 | 6F 72 64 65 72 73
+^    ^       "orders"
+TOPIC_NOTIFICATION
+```
+
+### Where it fits: creating a topic across the cluster
+```
+1. client ──create_topic("orders", 3, 2)──▶ controller (broker 1)
+2. controller decides the placement:
+      orders-0 → leader 1, replicas [1, 2]
+      orders-1 → leader 2, replicas [2, 3]
+      orders-2 → leader 3, replicas [3, 1]
+   and saves it in ZooKeeper (the shared metadata store)
+3. controller ──topic_notification("orders")──▶ broker 2
+   controller ──topic_notification("orders")──▶ broker 3
+4. brokers 2 and 3 read the "orders" details from ZooKeeper and create their partitions on disk
+```
+
+### Why only the name?
+The full details (which partitions, leaders, replicas) are already in ZooKeeper. The notification is just
+a **"wake up, something changed"** signal. Every broker reads the same data from one place, so there's
+**one source of truth**, and the message stays tiny.
+
+### What if this method didn't exist?
+Only the controller would know about the new topic. Example: a producer sends to `orders-1`, metadata
+says the leader is broker 2, but broker 2 never heard of `orders` → it answers "unknown topic".
+The topic exists on paper but nobody except the controller can serve it, until the brokers restart and
+reload everything from ZooKeeper.
+
+### Real Kafka equivalent
+- **Older Kafka (ZooKeeper mode):** same idea. The controller wrote to ZooKeeper and sent
+  `LeaderAndIsr` / `UpdateMetadata` requests to the brokers.
+- **Kafka 3.3+ (KRaft mode, ZooKeeper removed in 4.0):** no notifications. The controllers keep an
+  internal metadata log (`__cluster_metadata`), and every broker **pulls** it continuously, like a follower
+  fetching a partition. A new topic is just a new record in that log. Same pull design as replication.
