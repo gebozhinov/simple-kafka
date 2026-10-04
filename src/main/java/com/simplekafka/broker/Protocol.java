@@ -7,6 +7,7 @@ public class Protocol {
     // Client request types
     public static final byte PRODUCE = 0x01;
     public static final byte FETCH = 0x02;
+    public static final byte METADATA = 0x03;
 
     /**
      * Serializes a produce request into bytes ready to be written to a socket.
@@ -55,4 +56,18 @@ public class Protocol {
         return buffer;
     }
 
+    /**
+     * Serializes a metadata request: "tell me about the cluster".
+     * The broker answers with all brokers (id, host, port) and, for every topic,
+     * each partition's leader and replicas. Clients use it to find which broker to talk to.
+     * <p>
+     * Wire layout: [type:1]. No fields, the request type alone is the whole question.
+     * See notes/stage-2-protocol.md for an example.
+     */
+    public static ByteBuffer encodeMetadataRequest() {
+        ByteBuffer buffer = ByteBuffer.allocate(1);
+        buffer.put(METADATA);
+        buffer.flip();
+        return buffer;
+    }
 }

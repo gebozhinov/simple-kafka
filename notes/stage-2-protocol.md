@@ -2,6 +2,8 @@
 
 Source: https://buildthingsuseful.medium.com/stage-2-building-your-own-kafka-creating-the-core-protocol-layer-5838c1b2364c
 Code: `src/main/java/com/simplekafka/broker/Protocol.java`
+Broker concepts (leaders, replicas, failures): see `brokers.md`
+Consumer concepts (commits, restarts, delivery guarantees): see `consumers.md`
 
 ## Why a protocol at all?
 
@@ -18,7 +20,7 @@ otherwise the other side reads garbage.
 
 ---
 
-## `encodeProduceRequest`(String topic, int partition, byte[] message)`
+## `encodeProduceRequest` (String topic, int partition, byte[] message)`
 
 ### Purpose
 Serializes a "produce" request (send a message to topic/partition) into bytes
@@ -141,7 +143,7 @@ encode → decode gives back `"orders"`, `0`, `"hi"`.
 
 ---
 
-## `encodeFetchRequest`(String topic, int partition, long offset, int maxBytes)`
+## `encodeFetchRequest` (String topic, int partition, long offset, int maxBytes)`
 
 ### Purpose
 The opposite of produce. A **consumer** uses it to ask the broker:
@@ -232,90 +234,73 @@ Real Kafka also limits size on the **write** side, so huge messages are rejected
 
 Lesson: **limit size where data comes in (produce), not only where it goes out (fetch).**
 
-### Where does the consumer resume after a restart?
-
-**In simple-kafka: it doesn't remember.** `SimpleKafkaConsumer.currentOffset` is just a field in memory.
-After a restart it starts again from the `startOffset` passed to the constructor (e.g. 0) and
-re-reads everything. There are no commits and no consumer groups.
-
-**In real Kafka: committed offsets.**
-- The consumer periodically **commits** "for group `G`, topic `T`, partition `P`, the next offset is `N`".
-- Commits are stored by the broker in an internal topic, **`__consumer_offsets`**, keyed by `(group.id, topic, partition)`.
-  One broker acts as the **group coordinator** for each group.
-- After a restart, the consumer joins its group, gets its partitions, asks the coordinator
-  "what's my committed offset?" and starts fetching from there.
-- **No committed offset** (new group, or offsets expired) → `auto.offset.reset` decides: `earliest` (from the start) or `latest` (only new messages).
-- The committed offset is the **next** offset to read (last processed + 1).
-- The same thing happens on a **rebalance**: the consumer that takes over a partition starts from the committed offset.
-
-**When you commit decides what a crash costs you:**
-
-```
-Commit AFTER processing (at-least-once):
-  fetch 10..14 → process 10..14 → 💥 crash → (commit never happens)
-  restart → committed = 10 → process 10..14 AGAIN → duplicates
-
-Commit BEFORE processing (at-most-once):
-  fetch 10..14 → commit 15 → process 10, 11 → 💥 crash
-  restart → committed = 15 → 12..14 are never processed → lost
-```
-
-- **Auto-commit** (`enable.auto.commit=true`, every `auto.commit.interval.ms` = 5 s): inside `poll()` it commits
-  what the *previous* `poll()` returned. A crash means up to ~5 s of messages are processed again. It's at-least-once,
-  **unless** you hand messages to another thread: then a commit can happen before that thread is done → possible loss.
-- **Manual commit** (`commitSync()` after processing): you control it; at-least-once.
-- **At-least-once means duplicates will happen** → make processing **idempotent** (e.g. upsert by a unique ID).
-- **Exactly-once**: Kafka transactions (consume → produce to Kafka), or store the offset in the same DB transaction as the result.
-
-**Gotcha:** committed offsets expire if the group is inactive longer than `offsets.retention.minutes`
-(default 7 days). A consumer that was stopped for longer starts from `auto.offset.reset` again.
-
-### How to tell if a consumer is at-least-once or at-most-once
-
-There is **no single setting**. It comes from the config **plus** where the code commits:
-
-| `enable.auto.commit` | Code                                                | Result                                  |
-|----------------------|-----------------------------------------------------|-----------------------------------------|
-| `true`               | processes messages in the poll loop (same thread)   | at-least-once                           |
-| `true`               | hands messages to another thread / async            | can **lose** messages (no guarantee)    |
-| `false`              | `commitSync()` / `commitAsync()` **after** processing | at-least-once                         |
-| `false`              | commits **before** processing                       | at-most-once                            |
-
-Spring Kafka (`@KafkaListener`): auto-commit is off by default and the container commits for you
-after the listener returns (`AckMode.BATCH`) → at-least-once. With `AckMode.MANUAL`, look for `ack.acknowledge()`.
-
-Check at runtime:
-```
-kafka-consumer-groups.sh --bootstrap-server <host:9092> --describe --group <group.id>
-```
-Shows per partition `CURRENT-OFFSET` (committed), `LOG-END-OFFSET` (latest), and `LAG` (difference).
-
 ---
 
+## `encodeMetadataRequest`
+
+### Purpose
+The client asks a broker: **"Tell me about the cluster."** Which brokers exist, which topics exist,
+and for every partition, which broker is the **leader**. Without it the client would only know the
+one broker address you configured, and wouldn't know where to send produce/fetch requests.
+
+### Wire layout
+
+| Field        | Type | Size (bytes) |
+|--------------|------|--------------|
+| request type | byte | 1            |
+
+That's all: `01` would be produce, `03` is metadata. There are no parameters, because this simple
+version always asks for **everything**. The whole request is one byte:
+
+```
+03
+```
+
+### Example
+Cluster: 3 brokers, topic `orders` with 2 partitions, replicated on 2 brokers each.
+
+Client config only knows `localhost:9091`. It sends `03` there and gets back (in plain words; the exact bytes are covered with `decodeMetadataResponse`):
+
+```
+brokers:
+  1 → localhost:9091
+  2 → localhost:9092
+  3 → localhost:9093
+topics:
+  orders
+    partition 0 → leader 1, replicas [1, 2]
+    partition 1 → leader 2, replicas [2, 3]
+```
+
+Now `producer.send("orders", partition 1, ...)`:
+1. look up `orders` / partition 1 → leader is broker 2
+2. look up broker 2 → `localhost:9092`
+3. open a connection to `localhost:9092` and send the produce request there
+
+### When the client asks again (refresh)
+The client **caches** the metadata and refreshes it when it's missing or wrong
+(`SimpleKafkaClient.refreshMetadata()` in the reference):
+- on startup
+- when the topic isn't in the cache (e.g. it was just created)
+- when the leader broker id isn't known
+
+If a broker dies, another replica becomes leader. Old metadata now points to a dead broker,
+so the client must refresh to find the new leader.
+
+### What if you don't have it?
+The client would have to hard-code which broker owns which partition. Add a broker, move a
+partition, or lose a leader → every client breaks. Metadata makes the cluster **discoverable**:
+clients need just one address to get in, and learn the rest.
+
+### Real Kafka equivalent
+- Metadata request is api_key = 3. Unlike ours, it takes a **list of topics** (only ask about what you use).
+- `bootstrap.servers` = the address(es) used for the first metadata request. You don't need to list
+  every broker, 2-3 is enough (more than one, in case the first is down).
+- Clients refresh metadata at least every `metadata.max.age.ms` (default 5 min), and immediately on
+  errors like `NOT_LEADER_OR_FOLLOWER` or `UNKNOWN_TOPIC_OR_PARTITION`.
+- **Common gotcha:** the broker returns its **`advertised.listeners`** address, not the address you
+  connected to. If that's set to an internal hostname (e.g. a Docker container name), the client
+  connects to bootstrap fine, gets metadata, then fails to reach the leader. "Connects, then times out"
+  is very often this.
+
 ---
-
-## What is a broker?
-
-A **broker is one Kafka server**: a running program (a JVM process) on a machine, listening on a
-TCP port (usually 9092). It:
-1. **receives** messages from producers (Produce requests) and **writes them to disk**
-2. **sends** stored messages to consumers (Fetch requests)
-3. **answers questions** about the cluster (Metadata requests)
-
-Producers and consumers never talk to each other. They only talk to brokers.
-The broker is the "post office" in the middle.
-
-```
-Producer ──Produce──▶  BROKER  ──Fetch──▶ Consumer
-                      (stores messages on disk)
-```
-
-Several brokers working together = a **Kafka cluster**. Partitions are spread across them, so
-the load is shared and a copy survives if one broker dies.
-
-On disk each partition is a folder of log files, e.g. `/var/lib/kafka/data/orders-0/00000000000000000000.log`
-(config `log.dirs`).
-
-In simple-kafka the broker is `SimpleKafkaBroker.java`: it opens a socket, reads the bytes produced by
-our `encode...Request` methods, decodes them, and writes/reads messages in `Partition.java`.
-`BrokerInfo` (id, host, port) is how one broker is described to clients.
