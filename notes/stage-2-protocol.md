@@ -500,3 +500,115 @@ reload everything from ZooKeeper.
 - **Kafka 3.3+ (KRaft mode, ZooKeeper removed in 4.0):** no notifications. The controllers keep an
   internal metadata log (`__cluster_metadata`), and every broker **pulls** it continuously, like a follower
   fetching a partition. A new topic is just a new record in that log. Same pull design as replication.
+
+---
+
+## `decodeProduceResponse` (ByteBuffer buffer)
+
+### Purpose
+The first **decode** method: the reverse of encoding. After the producer sends a produce request,
+the broker answers with bytes. This method turns those bytes back into a Java object, `ProduceResult`,
+that tells the producer **did it work, and at which offset was my message stored?**
+
+```
+producer ──encodeProduceRequest──▶ broker
+producer ◀──── response bytes ──── broker
+         decodeProduceResponse → ProduceResult(offset=7, error=null)
+```
+
+### The broker can answer in two shapes
+The first byte says which shape follows, so the method **must read it first**.
+
+**1. A produce response** (built in the reference `SimpleKafkaBroker`):
+
+| Field         | Type | Size | Meaning                                   |
+|---------------|------|------|-------------------------------------------|
+| response type | byte | 1    | `PRODUCE_RESPONSE` (0x11)                 |
+| offset        | long | 8    | where the message was stored              |
+| status        | byte | 1    | `0` = success, anything else = failed     |
+
+**2. An error response** (`sendErrorResponse`), e.g. topic not found:
+
+| Field         | Type  | Size | Meaning                     |
+|---------------|-------|------|-----------------------------|
+| response type | byte  | 1    | `ERROR_RESPONSE` (0x1F)     |
+| error length  | short | 2    | how many bytes of text      |
+| error message | bytes | N    | the text                    |
+
+### Line by line
+```java
+byte responseType = buffer.get();             // read 1 byte, cursor moves to byte 1
+if (responseType != PRODUCE_RESPONSE) {       // not the normal answer?
+    if (responseType == ERROR_RESPONSE) {     //   is it a broker error with a message?
+        short errorLength = buffer.getShort();        // 2 bytes: how long is the text
+        byte[] errorBytes = new byte[errorLength];    // make room for exactly that many bytes
+        buffer.get(errorBytes);                       // copy them out of the buffer
+        String error = new String(errorBytes);        // bytes → text
+        return new ProduceResult(-1, error);          // -1 = "no offset", there's no message stored
+    }
+    return new ProduceResult(-1, "Invalid response type");  // a byte we don't recognize at all
+}
+long offset = buffer.getLong();               // 8 bytes: the offset
+byte status = buffer.get();                   // 1 byte: 0 = ok
+return new ProduceResult(offset, status == 0 ? null : "Produce failed");
+```
+
+It's the same length-prefix idea as encoding, in reverse: read the length, then read exactly that many bytes.
+
+### Examples
+
+**Success:** message stored at offset 7
+```
+11 | 00 00 00 00 00 00 00 07 | 00
+^    offset=7                  status=0 (ok)
+PRODUCE_RESPONSE
+→ ProduceResult(offset=7, error=null)   isSuccess() = true
+```
+
+**Broker error:** the topic doesn't exist
+```
+1F | 00 0F | 54 6F 70 69 63 20 6E 6F 74 20 66 6F 75 6E 64
+^    len=15  "Topic not found"
+ERROR_RESPONSE
+→ ProduceResult(offset=-1, error="Topic not found")   isSuccess() = false
+```
+
+**Write failed:** the broker understood the request but couldn't store it
+```
+11 | FF FF FF FF FF FF FF FF | 01
+     offset=-1                 status=1
+→ ProduceResult(offset=-1, error="Produce failed")
+```
+
+**Unknown type**, e.g. `12 ...` (a FETCH_RESPONSE) → `ProduceResult(-1, "Invalid response type")`.
+This usually means the client and broker are **out of sync**: the client is reading from the wrong
+position in the stream, so the rest of the bytes are garbage too. Real clients close the connection then.
+
+### `ProduceResult` conventions
+- `error == null` means success, that's what `isSuccess()` checks.
+- `offset == -1` means "no offset" (offsets start at 0, so -1 can't be a real one).
+
+### Why the order of `get()` calls matters
+Each `get...()` moves the cursor forward (same cursor as in `flip()`). Read the fields in a different order
+than the broker wrote them, and you get wrong values with **no error**: e.g. reading `status` before
+`offset` would take the first byte of the offset as the status.
+
+### Pitfall
+`new String(errorBytes)` uses the platform default charset. Use `new String(errorBytes, StandardCharsets.UTF_8)`,
+same reason as `getBytes(StandardCharsets.UTF_8)` when encoding: both sides must agree on the charset.
+
+### What if this method didn't exist?
+The producer would send messages and never know if they were stored. No offset, no error: a topic-not-found
+or a disk-full broker would look exactly like success.
+
+### Real Kafka equivalent
+- The Produce response has, per partition, an **error code** (a number, not text, e.g. `3 = UNKNOWN_TOPIC_OR_PARTITION`)
+  and the **base offset** of the batch.
+- This is what you get in the producer callback: `RecordMetadata.offset()` on success, or the exception.
+  ```java
+  producer.send(record, (metadata, exception) -> {
+      if (exception == null) System.out.println("stored at offset " + metadata.offset());
+      else                   System.out.println("failed: " + exception);
+  });
+  ```
+- With `acks=0` there is **no response at all**, so the offset is unknown (`-1`) and errors are never reported.

@@ -148,4 +148,42 @@ public class Protocol {
         buffer.flip();
         return buffer;
     }
+
+    /**
+     * Turns the broker's answer to a produce request back into a {@link ProduceResult}.
+     * <p>
+     * Two possible layouts, chosen by the first byte:
+     * [PRODUCE_RESPONSE:1][offset:8][status:1]          status 0 = ok
+     * [ERROR_RESPONSE:1][errorLen:2][error:N]
+     * <p>
+     * See notes/stage-2-protocol.md for examples.
+     */
+    public static ProduceResult decodeProduceResponse(ByteBuffer buffer) {
+        byte responseType = buffer.get();
+        if (responseType != PRODUCE_RESPONSE) {
+            if (responseType == ERROR_RESPONSE) {
+                short errorLength = buffer.getShort();
+                byte[] errorBytes = new byte[errorLength];
+                buffer.get(errorBytes);
+                String error = new String(errorBytes, StandardCharsets.UTF_8);
+                return new ProduceResult(-1, error);
+            }
+            return new ProduceResult(-1, "Invalid response type");
+        }
+
+        long offset = buffer.getLong();
+        byte status = buffer.get();
+
+        return new ProduceResult(offset, status == 0 ? null : "Produce failed");
+    }
+
+        /**
+         * Result record for produce operations
+         */
+        public record ProduceResult(long offset, String error) {
+
+        public boolean isSuccess() {
+                return error == null;
+            }
+        }
 }
