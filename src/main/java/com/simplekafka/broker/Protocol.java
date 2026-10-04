@@ -8,6 +8,19 @@ public class Protocol {
     public static final byte PRODUCE = 0x01;
     public static final byte FETCH = 0x02;
     public static final byte METADATA = 0x03;
+    public static final byte CREATE_TOPIC = 0x04;
+
+    // Broker response types
+    public static final byte PRODUCE_RESPONSE = 0x11;
+    public static final byte FETCH_RESPONSE = 0x12;
+    public static final byte METADATA_RESPONSE = 0x13;
+    public static final byte CREATE_TOPIC_RESPONSE = 0x14;
+    public static final byte ERROR_RESPONSE = 0x1F;
+
+    // Internal broker communication
+    public static final byte REPLICATE = 0x21;
+    public static final byte REPLICATE_ACK = 0x22;
+    public static final byte TOPIC_NOTIFICATION = 0x23;
 
     /**
      * Serializes a produce request into bytes ready to be written to a socket.
@@ -67,6 +80,27 @@ public class Protocol {
     public static ByteBuffer encodeMetadataRequest() {
         ByteBuffer buffer = ByteBuffer.allocate(1);
         buffer.put(METADATA);
+        buffer.flip();
+        return buffer;
+    }
+
+    /**
+     * Serializes a create-topic request: "create topic X with N partitions, each stored on R brokers".
+     * <p>
+     * Wire layout:
+     * [type:1][topicLen:2][topic:N][numPartitions:4][replicationFactor:2]
+     * <p>
+     * Fixed part = 1 + 2 + 4 + 2 = 9 bytes.
+     * See notes/stage-2-protocol.md for an example.
+     */
+    public static ByteBuffer encodeCreateTopicRequest(String topic, int numPartitions, short replicationFactor) {
+        byte[] topicBytes = topic.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buffer = ByteBuffer.allocate(9 + topicBytes.length);
+        buffer.put(CREATE_TOPIC);
+        buffer.putShort((short) topicBytes.length);
+        buffer.put(topicBytes);
+        buffer.putInt(numPartitions);
+        buffer.putShort(replicationFactor);
         buffer.flip();
         return buffer;
     }

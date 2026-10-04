@@ -20,7 +20,7 @@ otherwise the other side reads garbage.
 
 ---
 
-## `encodeProduceRequest` (String topic, int partition, byte[] message)`
+## `encodeProduceRequest` (String topic, int partition, byte[] message)
 
 ### Purpose
 Serializes a "produce" request (send a message to topic/partition) into bytes
@@ -143,7 +143,7 @@ encode → decode gives back `"orders"`, `0`, `"hi"`.
 
 ---
 
-## `encodeFetchRequest` (String topic, int partition, long offset, int maxBytes)`
+## `encodeFetchRequest` (String topic, int partition, long offset, int maxBytes)
 
 ### Purpose
 The opposite of produce. A **consumer** uses it to ask the broker:
@@ -304,3 +304,69 @@ clients need just one address to get in, and learn the rest.
   is very often this.
 
 ---
+
+## `encodeCreateTopicRequest` (String topic, int numPartitions, short replicationFactor)`
+
+### Purpose
+The client asks a broker: **"Create topic X, split into N partitions, each stored on R brokers."**
+Produce and fetch need a topic and partition to exist first, and this is how they get created.
+
+### Wire layout
+
+| Field             | Type  | Size (bytes) |
+|-------------------|-------|--------------|
+| request type      | byte  | 1            |
+| topic length      | short | 2            |
+| topic             | bytes | N            |
+| numPartitions     | int   | 4            |
+| replicationFactor | short | 2            |
+
+Fixed part: `1 + 2 + 4 + 2 = 9`.
+
+### Example
+`encodeCreateTopicRequest("orders", 3, (short) 2)` → 15 bytes (9 + 6):
+
+```
+04 | 00 06 | 6F 72 64 65 72 73 | 00 00 00 03     | 00 02
+^    ^       "orders"            numPartitions=3   replicationFactor=2
+CREATE_TOPIC
+```
+
+Meaning: "Create `orders` with 3 partitions, and keep 2 copies of each partition."
+With 3 brokers, the cluster might place them like this (leaders spread out, copies on different brokers):
+
+```
+            broker 1     broker 2     broker 3
+orders-0    LEADER       follower
+orders-1                 LEADER       follower
+orders-2    follower                  LEADER
+```
+
+(See `brokers.md` for leaders and replicas.)
+
+### The two numbers
+- **numPartitions**: how many pieces the topic is split into.
+  - More partitions = more parallelism: in a consumer group, **each partition is read by at most one
+    consumer**, so 3 partitions = at most 3 consumers working in parallel. A 4th consumer would sit idle.
+  - Order is guaranteed only **inside** one partition, not across the whole topic.
+- **replicationFactor**: how many brokers keep a copy of each partition.
+  - `1` = no copies; if that broker dies, the partition is unavailable (or lost if the disk is gone).
+  - It can't be more than the number of brokers: you can't keep 3 copies on 2 brokers.
+  - It's a `short` because it's always a small number (usually 3); an `int` would just waste 2 bytes.
+
+### What if this method didn't exist?
+Clients couldn't create topics. The only options would be to create them by hand on the broker, or to have
+the broker create them automatically on the first produce, with default settings you didn't choose.
+
+### Real Kafka equivalent
+- **CreateTopics** request (api_key = 19). You use it through `AdminClient.createTopics(...)` or
+  `kafka-topics.sh --create --topic orders --partitions 3 --replication-factor 2`.
+- `replication-factor` > number of brokers → `InvalidReplicationFactorException`.
+- **Auto-creation:** with `auto.create.topics.enable=true`, producing to a missing topic creates it with
+  `num.partitions` (default 1) and `default.replication.factor` (default 1). A typo in a topic name then
+  quietly creates a new topic with **1 partition and no copies**. Many production clusters turn it off.
+- **Partitions can be increased later, never decreased.** Increasing them changes which partition a key
+  goes to (`hash(key) % numPartitions`), so messages with the same key may land in a different partition
+  than before, and per-key ordering breaks during the switch. Choose the count carefully up front.
+- **Replication factor** can't be changed with a simple setting; it needs a partition reassignment
+  (`kafka-reassign-partitions.sh`).
