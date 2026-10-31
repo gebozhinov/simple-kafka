@@ -3,6 +3,7 @@
 Source: https://buildthingsuseful.medium.com/stage-3-build-your-own-kafka-3baaf4c873de
 Code: `src/main/java/com/simplekafka/broker/ZookeeperClient.java`
 ZooKeeper concepts (znodes, ephemeral nodes, sessions, watches): see `zookeeper.md`
+How Kafka does the same today without ZooKeeper (KRaft): see `kraft.md`
 
 `ZookeeperClient` is a thin wrapper around the official ZooKeeper Java library (`org.apache.zookeeper.ZooKeeper`).
 The broker calls these methods instead of using the library directly.

@@ -4,6 +4,7 @@ Source: https://buildthingsuseful.medium.com/stage-2-building-your-own-kafka-cre
 Code: `src/main/java/com/simplekafka/broker/Protocol.java`
 Broker concepts (leaders, replicas, failures): see `brokers.md`
 Consumer concepts (commits, restarts, delivery guarantees): see `consumers.md`
+The real Kafka protocol (headers, API keys, versions, errors): see `protocol.md`
 
 ## Why a protocol at all?
 
@@ -147,6 +148,9 @@ Every real Kafka request starts with a **4-byte total size**, then a header:
 - `client_id`: this is your `client.id` config at work
 
 The body follows the header. Errors like `RecordTooLargeException` belong to this layer.
+
+The full picture (versions and ApiVersions, data types, a request byte by byte, error codes, pipelining):
+`protocol.md`.
 
 ---
 
